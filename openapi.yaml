@@ -2,24 +2,22 @@ openapi: 3.0.3
 info:
   title: InsureZen Claims API
   description: |
-    REST API for InsureZen medical insurance claim processing.
-    Supports the complete two-stage Maker → Checker review workflow with
-    concurrency safety and claim forwarding to insurance companies.
+    REST API for InsureZen medical insurance claim processing system.
+    Supports the complete Maker → Checker workflow with strict state machine,
+    concurrency safety, and claim forwarding.
   version: "1.0.0"
   contact:
-    name: InsureZen Backend Team
+    name: Muawiz Farooqi
 servers:
   - url: http://localhost:8080
     description: Local development server
-  - url: https://api.insurezen.com
-    description: Production server (example)
 
 components:
   schemas:
     ClaimStatus:
       type: string
       enum:
-        - INGESTED
+        - NEW
         - MAKER_ASSIGNED
         - MAKER_REVIEWED
         - CHECKER_ASSIGNED
@@ -30,48 +28,59 @@ components:
       type: string
       enum: [APPROVE, REJECT]
 
-    ClaimCreateRequest:
+    StandardizedData:
       type: object
-      required:
-        - insurerId
-        - insurerName
-        - policyNumber
-        - patientName
-        - dateOfService
-        - claimAmount
       properties:
-        externalClaimId:
-          type: string
-          example: "CLM-987654"
-        insurerId:
-          type: string
-          example: "INS-001"
-        insurerName:
-          type: string
-          example: "Al Sagr National Insurance"
-        policyNumber:
-          type: string
-          example: "POL-12345678"
         patientName:
           type: string
-          example: "Ahmed Al Mansoori"
         patientDateOfBirth:
           type: string
           format: date
-        dateOfService:
+        policyNumber:
           type: string
-          format: date
+        claimAmount:
+          type: number
+          format: float
         diagnosisCodes:
           type: array
           items:
             type: string
-        claimAmount:
+        procedureCodes:
+          type: array
+          items:
+            type: string
+        serviceDate:
+          type: string
+          format: date
+        providerName:
+          type: string
+        totalBilledAmount:
           type: number
           format: float
-          example: 12500.75
-        currency:
+        insuranceCoveredAmount:
+          type: number
+          format: float
+        patientResponsibility:
+          type: number
+          format: float
+
+    ClaimCreateRequest:
+      type: object
+      required:
+        - insuranceCompany
+        - standardizedData
+      properties:
+        externalClaimReference:
           type: string
-          default: "AED"
+          example: "CLM-987654"
+        insuranceCompany:
+          type: string
+          example: "Al Sagr National Insurance"
+        submissionDate:
+          type: string
+          format: date-time
+        standardizedData:
+          $ref: '#/components/schemas/StandardizedData'
 
     MakerRecommendationRequest:
       type: object
@@ -80,7 +89,7 @@ components:
       properties:
         recommendation:
           $ref: '#/components/schemas/Recommendation'
-        notes:
+        makerFeedback:
           type: string
           example: "All documents verified. Treatment is medically necessary."
 
@@ -91,62 +100,55 @@ components:
       properties:
         decision:
           $ref: '#/components/schemas/Recommendation'
-        notes:
+        checkerFeedback:
           type: string
           example: "Recommendation accepted after second verification."
 
     ClaimDto:
       type: object
       properties:
-        id:
+        claimId:
           type: string
           format: uuid
-        externalClaimId:
+        externalClaimReference:
           type: string
-        insurerId:
+        insuranceCompany:
           type: string
-        insurerName:
+        submissionDate:
           type: string
-        policyNumber:
-          type: string
-        patientName:
-          type: string
-        dateOfService:
-          type: string
-          format: date
-        claimAmount:
-          type: number
-          format: float
-        currency:
-          type: string
+          format: date-time
+        standardizedData:
+          $ref: '#/components/schemas/StandardizedData'
         status:
           $ref: '#/components/schemas/ClaimStatus'
+        makerId:
+          type: string
+        makerFeedback:
+          type: string
         makerRecommendation:
-          type: object
+          $ref: '#/components/schemas/Recommendation'
           nullable: true
-          properties:
-            recommendation:
-              $ref: '#/components/schemas/Recommendation'
-            notes:
-              type: string
-            reviewedAt:
-              type: string
-              format: date-time
+        makerReviewedAt:
+          type: string
+          format: date-time
+          nullable: true
+        checkerId:
+          type: string
         checkerDecision:
-          type: object
+          $ref: '#/components/schemas/Recommendation'
           nullable: true
-          properties:
-            decision:
-              $ref: '#/components/schemas/Recommendation'
-            notes:
-              type: string
-            reviewedAt:
-              type: string
-              format: date-time
+        checkerFeedback:
+          type: string
+        checkerReviewedAt:
+          type: string
+          format: date-time
+          nullable: true
         forwardedAt:
           type: string
           format: date-time
           nullable: true
+        forwardedTo:
+          type: string
         createdAt:
           type: string
           format: date-time
@@ -163,13 +165,10 @@ components:
             $ref: '#/components/schemas/ClaimDto'
         total:
           type: integer
-          example: 245
         page:
           type: integer
-          example: 1
         size:
           type: integer
-          example: 20
 
   responses:
     Error400:
@@ -179,11 +178,8 @@ components:
           schema:
             type: object
             properties:
-              message:
-                type: string
-              errors:
-                type: object
-
+              message: { type: string }
+              errors: { type: object }
     Error404:
       description: Claim not found
     Error409:
@@ -192,8 +188,8 @@ components:
 paths:
   /api/v1/claims:
     post:
-      summary: Ingest new claim (start of Maker flow)
-      description: Receives standardized claim data from upstream extraction service.
+      summary: Ingest new claim (Upstream OCR Service)
+      description: Creates a new Claim with status NEW
       requestBody:
         required: true
         content:
@@ -202,7 +198,7 @@ paths:
               $ref: '#/components/schemas/ClaimCreateRequest'
       responses:
         '201':
-          description: Claim successfully ingested (status = INGESTED)
+          description: Claim successfully ingested
           content:
             application/json:
               schema:
@@ -212,36 +208,39 @@ paths:
 
     get:
       summary: Paginated & filterable claim history
-      description: Used by frontend dashboard for searchable history.
+      description: Used by Frontend Dashboard
       parameters:
         - name: page
           in: query
-          schema:
-            type: integer
-            default: 1
+          schema: { type: integer, default: 1 }
         - name: size
           in: query
-          schema:
-            type: integer
-            default: 20
+          schema: { type: integer, default: 20 }
         - name: status
           in: query
           schema:
             $ref: '#/components/schemas/ClaimStatus'
-        - name: insurerId
+        - name: insuranceCompany
           in: query
-          schema:
-            type: string
+          schema: { type: string }
         - name: startDate
           in: query
-          schema:
-            type: string
-            format: date
+          schema: { type: string, format: date }
         - name: endDate
           in: query
-          schema:
-            type: string
-            format: date
+          schema: { type: string, format: date }
+      responses:
+        '200':
+          description: Paginated claims
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedResponse'
+
+  /api/v1/claims/history:
+    get:
+      summary: Alternative alias for claim history
+      parameters: [] # same as above
       responses:
         '200':
           description: Paginated claims
@@ -262,7 +261,7 @@ paths:
             format: uuid
       responses:
         '200':
-          description: Claim details
+          description: Full claim details
           content:
             application/json:
               schema:
@@ -273,8 +272,7 @@ paths:
   # ==================== MAKER FLOW ====================
   /api/v1/maker/claims/pending:
     get:
-      summary: Claims available for Maker review
-      description: Returns only INGESTED claims that are not yet assigned.
+      summary: Claims available for Maker review (status = NEW)
       responses:
         '200':
           description: List of available claims
@@ -287,8 +285,7 @@ paths:
 
   /api/v1/claims/{claimId}/maker/assign:
     post:
-      summary: Maker claims/locks a claim (concurrency protection)
-      description: Prevents any other Maker from working on the same claim.
+      summary: Maker assigns/locks a claim (concurrency protection)
       parameters:
         - name: claimId
           in: path
@@ -298,7 +295,7 @@ paths:
             format: uuid
       responses:
         '200':
-          description: Claim successfully assigned to this Maker
+          description: Claim assigned to Maker (status → MAKER_ASSIGNED)
           content:
             application/json:
               schema:
@@ -309,7 +306,6 @@ paths:
   /api/v1/claims/{claimId}/maker/recommendation:
     post:
       summary: Submit Maker recommendation & feedback
-      description: Moves claim from MAKER_ASSIGNED → MAKER_REVIEWED.
       parameters:
         - name: claimId
           in: path
@@ -325,22 +321,19 @@ paths:
               $ref: '#/components/schemas/MakerRecommendationRequest'
       responses:
         '200':
-          description: Recommendation saved
+          description: Maker review saved (status → MAKER_REVIEWED)
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ClaimDto'
-        '400':
-          $ref: '#/components/responses/Error400'
 
   # ==================== CHECKER FLOW ====================
   /api/v1/checker/claims/pending:
     get:
-      summary: Claims ready for Checker review
-      description: Returns MAKER_REVIEWED claims that are not yet assigned to a Checker.
+      summary: Claims ready for Checker review (status = MAKER_REVIEWED)
       responses:
         '200':
-          description: List of claims awaiting checker
+          description: List of claims awaiting Checker
           content:
             application/json:
               schema:
@@ -350,7 +343,7 @@ paths:
 
   /api/v1/claims/{claimId}/checker/assign:
     post:
-      summary: Checker claims/locks a claim (concurrency protection)
+      summary: Checker assigns/locks a claim (concurrency protection)
       parameters:
         - name: claimId
           in: path
@@ -360,7 +353,7 @@ paths:
             format: uuid
       responses:
         '200':
-          description: Claim assigned to this Checker
+          description: Claim assigned to Checker (status → CHECKER_ASSIGNED)
           content:
             application/json:
               schema:
@@ -372,10 +365,8 @@ paths:
     post:
       summary: Submit Checker final decision + forwarding
       description: |
-        Final internal decision. Automatically:
-        • Sets status to COMPLETED → FORWARDED
-        • Records forwardedAt timestamp
-        • Logs the forwarding action (stub - no real external call required)
+        Final decision. Automatically transitions status to COMPLETED → FORWARDED,
+        sets forwardedAt timestamp, and logs forwarding action (stub).
       parameters:
         - name: claimId
           in: path
@@ -396,5 +387,3 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ClaimDto'
-        '400':
-          $ref: '#/components/responses/Error400'
