@@ -1,0 +1,400 @@
+openapi: 3.0.3
+info:
+  title: InsureZen Claims API
+  description: |
+    REST API for InsureZen medical insurance claim processing.
+    Supports the complete two-stage Maker → Checker review workflow with
+    concurrency safety and claim forwarding to insurance companies.
+  version: "1.0.0"
+  contact:
+    name: InsureZen Backend Team
+servers:
+  - url: http://localhost:8080
+    description: Local development server
+  - url: https://api.insurezen.com
+    description: Production server (example)
+
+components:
+  schemas:
+    ClaimStatus:
+      type: string
+      enum:
+        - INGESTED
+        - MAKER_ASSIGNED
+        - MAKER_REVIEWED
+        - CHECKER_ASSIGNED
+        - COMPLETED
+        - FORWARDED
+
+    Recommendation:
+      type: string
+      enum: [APPROVE, REJECT]
+
+    ClaimCreateRequest:
+      type: object
+      required:
+        - insurerId
+        - insurerName
+        - policyNumber
+        - patientName
+        - dateOfService
+        - claimAmount
+      properties:
+        externalClaimId:
+          type: string
+          example: "CLM-987654"
+        insurerId:
+          type: string
+          example: "INS-001"
+        insurerName:
+          type: string
+          example: "Al Sagr National Insurance"
+        policyNumber:
+          type: string
+          example: "POL-12345678"
+        patientName:
+          type: string
+          example: "Ahmed Al Mansoori"
+        patientDateOfBirth:
+          type: string
+          format: date
+        dateOfService:
+          type: string
+          format: date
+        diagnosisCodes:
+          type: array
+          items:
+            type: string
+        claimAmount:
+          type: number
+          format: float
+          example: 12500.75
+        currency:
+          type: string
+          default: "AED"
+
+    MakerRecommendationRequest:
+      type: object
+      required:
+        - recommendation
+      properties:
+        recommendation:
+          $ref: '#/components/schemas/Recommendation'
+        notes:
+          type: string
+          example: "All documents verified. Treatment is medically necessary."
+
+    CheckerDecisionRequest:
+      type: object
+      required:
+        - decision
+      properties:
+        decision:
+          $ref: '#/components/schemas/Recommendation'
+        notes:
+          type: string
+          example: "Recommendation accepted after second verification."
+
+    ClaimDto:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        externalClaimId:
+          type: string
+        insurerId:
+          type: string
+        insurerName:
+          type: string
+        policyNumber:
+          type: string
+        patientName:
+          type: string
+        dateOfService:
+          type: string
+          format: date
+        claimAmount:
+          type: number
+          format: float
+        currency:
+          type: string
+        status:
+          $ref: '#/components/schemas/ClaimStatus'
+        makerRecommendation:
+          type: object
+          nullable: true
+          properties:
+            recommendation:
+              $ref: '#/components/schemas/Recommendation'
+            notes:
+              type: string
+            reviewedAt:
+              type: string
+              format: date-time
+        checkerDecision:
+          type: object
+          nullable: true
+          properties:
+            decision:
+              $ref: '#/components/schemas/Recommendation'
+            notes:
+              type: string
+            reviewedAt:
+              type: string
+              format: date-time
+        forwardedAt:
+          type: string
+          format: date-time
+          nullable: true
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+
+    PaginatedResponse:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/ClaimDto'
+        total:
+          type: integer
+          example: 245
+        page:
+          type: integer
+          example: 1
+        size:
+          type: integer
+          example: 20
+
+  responses:
+    Error400:
+      description: Bad Request - Validation error
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              message:
+                type: string
+              errors:
+                type: object
+
+    Error404:
+      description: Claim not found
+    Error409:
+      description: Conflict - Claim already assigned to another user
+
+paths:
+  /api/v1/claims:
+    post:
+      summary: Ingest new claim (start of Maker flow)
+      description: Receives standardized claim data from upstream extraction service.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ClaimCreateRequest'
+      responses:
+        '201':
+          description: Claim successfully ingested (status = INGESTED)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClaimDto'
+        '400':
+          $ref: '#/components/responses/Error400'
+
+    get:
+      summary: Paginated & filterable claim history
+      description: Used by frontend dashboard for searchable history.
+      parameters:
+        - name: page
+          in: query
+          schema:
+            type: integer
+            default: 1
+        - name: size
+          in: query
+          schema:
+            type: integer
+            default: 20
+        - name: status
+          in: query
+          schema:
+            $ref: '#/components/schemas/ClaimStatus'
+        - name: insurerId
+          in: query
+          schema:
+            type: string
+        - name: startDate
+          in: query
+          schema:
+            type: string
+            format: date
+        - name: endDate
+          in: query
+          schema:
+            type: string
+            format: date
+      responses:
+        '200':
+          description: Paginated claims
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedResponse'
+
+  /api/v1/claims/{claimId}:
+    get:
+      summary: Get full claim details
+      parameters:
+        - name: claimId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Claim details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClaimDto'
+        '404':
+          $ref: '#/components/responses/Error404'
+
+  # ==================== MAKER FLOW ====================
+  /api/v1/maker/claims/pending:
+    get:
+      summary: Claims available for Maker review
+      description: Returns only INGESTED claims that are not yet assigned.
+      responses:
+        '200':
+          description: List of available claims
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ClaimDto'
+
+  /api/v1/claims/{claimId}/maker/assign:
+    post:
+      summary: Maker claims/locks a claim (concurrency protection)
+      description: Prevents any other Maker from working on the same claim.
+      parameters:
+        - name: claimId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Claim successfully assigned to this Maker
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClaimDto'
+        '409':
+          $ref: '#/components/responses/Error409'
+
+  /api/v1/claims/{claimId}/maker/recommendation:
+    post:
+      summary: Submit Maker recommendation & feedback
+      description: Moves claim from MAKER_ASSIGNED → MAKER_REVIEWED.
+      parameters:
+        - name: claimId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MakerRecommendationRequest'
+      responses:
+        '200':
+          description: Recommendation saved
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClaimDto'
+        '400':
+          $ref: '#/components/responses/Error400'
+
+  # ==================== CHECKER FLOW ====================
+  /api/v1/checker/claims/pending:
+    get:
+      summary: Claims ready for Checker review
+      description: Returns MAKER_REVIEWED claims that are not yet assigned to a Checker.
+      responses:
+        '200':
+          description: List of claims awaiting checker
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ClaimDto'
+
+  /api/v1/claims/{claimId}/checker/assign:
+    post:
+      summary: Checker claims/locks a claim (concurrency protection)
+      parameters:
+        - name: claimId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Claim assigned to this Checker
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClaimDto'
+        '409':
+          $ref: '#/components/responses/Error409'
+
+  /api/v1/claims/{claimId}/checker/decision:
+    post:
+      summary: Submit Checker final decision + forwarding
+      description: |
+        Final internal decision. Automatically:
+        • Sets status to COMPLETED → FORWARDED
+        • Records forwardedAt timestamp
+        • Logs the forwarding action (stub - no real external call required)
+      parameters:
+        - name: claimId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CheckerDecisionRequest'
+      responses:
+        '200':
+          description: Final decision saved and claim forwarded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClaimDto'
+        '400':
+          $ref: '#/components/responses/Error400'
