@@ -23,10 +23,10 @@ This document provides a complete requirements breakdown for the InsureZen medic
    - `status` (enum – see state transitions below)
    - `makerId` (string – ID of the Maker who reviewed the claim)
    - `makerFeedback` (string – optional notes/annotations from the Maker)
-   - `makerRecommendation` (enum: `Approve` | `Reject` | `null`)
+   - `makerRecommendation` (`Recommendation` enum: `Approve` | `Reject` | `null`)
    - `makerReviewedAt` (datetime)
    - `checkerId` (string – ID of the Checker who reviewed the claim)
-   - `checkerDecision` (enum: `Approve` | `Reject` | `null`)
+   - `checkerDecision` (`Recommendation` enum: `Approve` | `Reject` | `null`)
    - `checkerFeedback` (string – optional notes from the Checker)
    - `checkerReviewedAt` (datetime)
    - `forwardedAt` (datetime – when the claim was forwarded to the insurance company)
@@ -34,12 +34,12 @@ This document provides a complete requirements breakdown for the InsureZen medic
    - `createdAt`, `updatedAt` (audit timestamps)
 
 2. **ClaimStatus** (enum – represents the state machine)
-   - `New` (ingested, awaiting Maker)
-   - `InMakerReview` (assigned to a Maker)
-   - `MakerReviewed` (Maker has submitted recommendation)
-   - `InCheckerReview` (assigned to a Checker)
-   - `Completed` (Checker has issued final decision)
-   - `Forwarded` (record sent to insurance company)
+   - `NEW` (ingested, awaiting Maker)
+   - `MAKER_ASSIGNED` (assigned to a Maker)
+   - `MAKER_REVIEWED` (Maker has submitted recommendation)
+   - `CHECKER_ASSIGNED` (assigned to a Checker)
+   - `COMPLETED` (Checker has issued final decision)
+   - `FORWARDED` (record sent to insurance company)
 
 3. **Employee** (abstract – Makers and Checkers)
    - `employeeId` (string)
@@ -127,21 +127,16 @@ The upstream service will POST a JSON payload conforming to the `Claim` entity (
 
 ## 6. Assumptions and Justifications
 
-| Assumption | Justification / Rationale |
-|------------|---------------------------|
-| Standardized claim data structure is defined by us (as per "You are expected to create this standardized input representation"). | Problem states upstream delivers standardized input; we must explicitly design the DTO for the API contract. |
-| Claim status follows a strict linear state machine. | Ensures data integrity and prevents invalid workflow states. |
-| Makers/Checkers are identified by simple `employeeId` (no full user management in core scope). | Authentication/Authorization is a Tier-2 bonus; core flow can operate with ID-based attribution. |
-| Claim assignment uses optimistic locking or database-level constraints (e.g., unique index on claimId + status). | Meets the explicit concurrency requirement without over-engineering (e.g., no distributed locks assumed for junior level). |
-| Forwarding is represented by a status change + log entry only. | Problem explicitly states "a stub or logged record of the forwarding action is sufficient." |
-| Analytical summary endpoints are part of the required API surface (even if not explicitly listed in Task 3). | Frontend is stated to consume APIs for summaries; omitting them would break the stated use case. |
-| Database will be PostgreSQL (Tier-1 bonus). | Modern, reliable choice with excellent concurrency support (row-level locking, transactions). |
-| All timestamps are stored in UTC. | Standard practice for distributed systems. |
-| Soft deletes are not required. | No mention of deletion in the problem statement. |
+| Assumption | Justification |
+|------------|---------------|
+| Claim uses a strict linear state machine with 6 states | Ensures data integrity and supports safe concurrent operations |
+| Makers and Checkers are identified only by `employeeId` | Authentication and full user management is a Tier-2 bonus task |
+| Concurrency is handled with optimistic locking or database constraints | Meets the explicit requirement without over-engineering for junior level |
+| Forwarding is represented by a status change plus log entry | Problem states a stub or logged record of the forwarding action is sufficient |
+| Analytical summary endpoints are part of the API | Frontend dashboard is stated to consume these for metrics |
+| PostgreSQL is used as the database | Recommended in Tier-1 bonus and provides excellent concurrency support |
+| All timestamps are stored in UTC | Standard practice for distributed systems |
+| Soft deletes are not implemented | Not mentioned anywhere in the problem statement |
+| Pagination and basic filtering are implemented with database indexes | Required for good performance when handling hundreds to thousands of claims per day. |
 
-All assumptions will be clearly documented in the README.md of the final submission.
-
----
-
-**End of Requirements Analysis**  
-This document will be included as `REQUIREMENTS.md` in the repository root. It will also be referenced in the main `README.md`.
+All assumptions will be clearly documented in the README.md
