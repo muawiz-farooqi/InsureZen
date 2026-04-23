@@ -1,26 +1,35 @@
 # Build outputs
-**/bin/
-**/obj/
+bin/
+obj/
 
-# Visual Studio / Rider / VS Code user files
-.vs/
-.idea/
-.vscode/
-*.suo
+# .NET
 *.user
-*.userosscache
-*.sln.docstates
+*.suo
+.vs/
+*.rsuser
 
-# Logs, temp, and cache files
-*.log
-*.tmp
-*.cache
+# Rider
+.idea/
 
-# OS-generated files
+# VS Code
+.vscode/
+
+# NuGet
+*.nupkg
+*.snupkg
+packages/
+project.lock.json
+project.fragment.lock.json
+artifacts/
+
+# Environment & secrets
+.env
+appsettings.Development.json
+appsettings.Local.json
+
+# Docker volumes
+pgdata/
+
+# OS
 .DS_Store
 Thumbs.db
-
-# Local environment and secrets
-.env
-.env.*
-appsettings.Development.json
