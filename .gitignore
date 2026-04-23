@@ -1,0 +1,26 @@
+# Build outputs
+**/bin/
+**/obj/
+
+# Visual Studio / Rider / VS Code user files
+.vs/
+.idea/
+.vscode/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# Logs, temp, and cache files
+*.log
+*.tmp
+*.cache
+
+# OS-generated files
+.DS_Store
+Thumbs.db
+
+# Local environment and secrets
+.env
+.env.*
+appsettings.Development.json
