@@ -3,17 +3,35 @@ info:
   title: InsureZen Claims API
   description: |
     REST API for InsureZen medical insurance claim processing system.
-    Supports the complete Maker → Checker workflow with strict state machine,
-    concurrency safety, and claim forwarding.
+
+    ## Workflow
+    Upstream OCR Service → **Maker** assigns & reviews → **Checker** assigns & decides → auto-forwarded.
+
+    ## State Machine
+    `NEW → MAKER_ASSIGNED → MAKER_REVIEWED → CHECKER_ASSIGNED → COMPLETED → FORWARDED`
+
+    ## Concurrency Safety
+    Assignment endpoints are race-condition-safe via EF Core `RowVersion` / PostgreSQL `xmin` optimistic concurrency.
+    Clients must pass the current `rowVersion` value in the `If-Match` header on mutating requests.
+    A mismatch returns `409 Conflict`.
+
+    ## Tech Stack
+    C# · ASP.NET Core Web API · Entity Framework Core · PostgreSQL · FluentValidation · Docker
   version: "1.0.0"
   contact:
     name: Muawiz Farooqi
+
 servers:
   - url: http://localhost:8080
-    description: Local development server
+    description: Local development server (Docker)
 
+# ──────────────────────────────────────────────────────────────────────────────
+# COMPONENTS
+# ──────────────────────────────────────────────────────────────────────────────
 components:
   schemas:
+
+    # ── Enums ──────────────────────────────────────────────────────────────────
     ClaimStatus:
       type: string
       enum:
@@ -28,8 +46,12 @@ components:
       type: string
       enum: [APPROVE, REJECT]
 
+    # ── Standardized OCR Data (stored as JSON column) ─────────────────────────
     StandardizedData:
       type: object
+      description: >
+        Extracted claim fields from the upstream OCR service.
+        Persisted as a flexible JSON column – schema may evolve without migrations.
       properties:
         patientName:
           type: string
@@ -64,6 +86,7 @@ components:
           type: number
           format: float
 
+    # ── Request Bodies ─────────────────────────────────────────────────────────
     ClaimCreateRequest:
       type: object
       required:
@@ -79,10 +102,21 @@ components:
         submissionDate:
           type: string
           format: date-time
+          description: Defaults to server UTC time if omitted.
         standardizedData:
           $ref: '#/components/schemas/StandardizedData'
 
-    MakerRecommendationRequest:
+    MakerAssignRequest:
+      type: object
+      required:
+        - makerId
+      properties:
+        makerId:
+          type: string
+          example: "emp-001"
+          description: Employee ID of the Maker claiming this work item.
+
+    MakerReviewRequest:
       type: object
       required:
         - recommendation
@@ -93,7 +127,17 @@ components:
           type: string
           example: "All documents verified. Treatment is medically necessary."
 
-    CheckerDecisionRequest:
+    CheckerAssignRequest:
+      type: object
+      required:
+        - checkerId
+      properties:
+        checkerId:
+          type: string
+          example: "emp-042"
+          description: Employee ID of the Checker claiming this work item.
+
+    CheckerReviewRequest:
       type: object
       required:
         - decision
@@ -104,8 +148,10 @@ components:
           type: string
           example: "Recommendation accepted after second verification."
 
+    # ── Response DTO ───────────────────────────────────────────────────────────
     ClaimDto:
       type: object
+      description: Full claim representation returned by all endpoints.
       properties:
         claimId:
           type: string
@@ -121,10 +167,29 @@ components:
           $ref: '#/components/schemas/StandardizedData'
         status:
           $ref: '#/components/schemas/ClaimStatus'
+        # ── Assignment tracking ──────────────────────────────────────────────
+        assignedTo:
+          type: string
+          nullable: true
+          description: Employee ID of whoever currently holds this claim (Maker or Checker stage).
+        assignedAt:
+          type: string
+          format: date-time
+          nullable: true
+          description: UTC timestamp of the most recent assignment.
+        rowVersion:
+          type: string
+          description: >
+            Opaque concurrency token (base-64 encoded EF Core RowVersion / PostgreSQL xmin).
+            Must be echoed back in the `If-Match` header on any subsequent mutating request.
+          example: "AAAAAAAAB9E="
+        # ── Maker audit fields ───────────────────────────────────────────────
         makerId:
           type: string
+          nullable: true
         makerFeedback:
           type: string
+          nullable: true
         makerRecommendation:
           $ref: '#/components/schemas/Recommendation'
           nullable: true
@@ -132,23 +197,29 @@ components:
           type: string
           format: date-time
           nullable: true
+        # ── Checker audit fields ─────────────────────────────────────────────
         checkerId:
           type: string
+          nullable: true
         checkerDecision:
           $ref: '#/components/schemas/Recommendation'
           nullable: true
         checkerFeedback:
           type: string
+          nullable: true
         checkerReviewedAt:
           type: string
           format: date-time
           nullable: true
+        # ── Forwarding ───────────────────────────────────────────────────────
         forwardedAt:
           type: string
           format: date-time
           nullable: true
         forwardedTo:
           type: string
+          nullable: true
+        # ── System timestamps ────────────────────────────────────────────────
         createdAt:
           type: string
           format: date-time
@@ -156,7 +227,7 @@ components:
           type: string
           format: date-time
 
-    PaginatedResponse:
+    PaginatedClaimsResponse:
       type: object
       properties:
         items:
@@ -165,31 +236,91 @@ components:
             $ref: '#/components/schemas/ClaimDto'
         total:
           type: integer
+          example: 240
         page:
           type: integer
+          example: 1
         size:
           type: integer
+          example: 20
 
+    ProblemDetails:
+      type: object
+      description: RFC 7807-style error body returned on 4xx responses.
+      properties:
+        title:
+          type: string
+          example: "Claim already assigned"
+        status:
+          type: integer
+          example: 409
+        detail:
+          type: string
+          example: "Claim abc-123 is already assigned to emp-007."
+        errors:
+          type: object
+          description: Field-level validation errors (400 only).
+          additionalProperties:
+            type: array
+            items:
+              type: string
+
+  # ── Reusable Parameters ───────────────────────────────────────────────────
+  parameters:
+    claimIdPath:
+      name: claimId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+      description: UUID of the target claim.
+
+    ifMatchHeader:
+      name: If-Match
+      in: header
+      required: false
+      schema:
+        type: string
+      description: >
+        Current `rowVersion` value (from the last fetched `ClaimDto`).
+        Required on PATCH requests in Phase 2 (PostgreSQL).
+        Omit in Phase 1 (in-memory). Mismatch → 409 Conflict.
+
+  # ── Reusable Responses ────────────────────────────────────────────────────
   responses:
     Error400:
-      description: Bad Request - Validation error
+      description: Bad Request – validation error
       content:
         application/json:
           schema:
-            type: object
-            properties:
-              message: { type: string }
-              errors: { type: object }
+            $ref: '#/components/schemas/ProblemDetails'
     Error404:
       description: Claim not found
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
     Error409:
-      description: Conflict - Claim already assigned to another user
+      description: Conflict – claim already assigned or concurrency token mismatch
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
 
+# ──────────────────────────────────────────────────────────────────────────────
+# PATHS
+# ──────────────────────────────────────────────────────────────────────────────
 paths:
-  /api/v1/claims:
+
+  # ── Ingestion ──────────────────────────────────────────────────────────────
+  /api/claims:
     post:
+      tags: [Claims]
       summary: Ingest new claim (Upstream OCR Service)
-      description: Creates a new Claim with status NEW
+      description: >
+        Creates a new Claim with status `NEW`.
+        Returns `201 Created` with the full ClaimDto including the initial `rowVersion`.
       requestBody:
         required: true
         content:
@@ -206,9 +337,45 @@ paths:
         '400':
           $ref: '#/components/responses/Error400'
 
+    # ── Paginated history ───────────────────────────────────────────────────
     get:
-      summary: Paginated & filterable claim history
-      description: Used by Frontend Dashboard
+      tags: [Claims]
+      summary: Paginated & filterable claim history (Frontend Dashboard)
+      parameters:
+        - name: page
+          in: query
+          schema: { type: integer, default: 1 }
+        - name: size
+          in: query
+          schema: { type: integer, default: 20 }
+        - name: status
+          in: query
+          schema:
+            $ref: '#/components/schemas/ClaimStatus'
+        - name: insuranceCompany
+          in: query
+          schema: { type: string }
+        - name: startDate
+          in: query
+          schema: { type: string, format: date }
+          description: Filter by `submissionDate` (inclusive lower bound, UTC date).
+        - name: endDate
+          in: query
+          schema: { type: string, format: date }
+          description: Filter by `submissionDate` (inclusive upper bound, UTC date).
+      responses:
+        '200':
+          description: Paginated claims list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedClaimsResponse'
+
+  /api/claims/history:
+    get:
+      tags: [Claims]
+      summary: Alias for paginated claim history
+      description: Same behaviour as `GET /api/claims`. Provided as a convenience alias for the dashboard.
       parameters:
         - name: page
           in: query
@@ -231,34 +398,19 @@ paths:
           schema: { type: string, format: date }
       responses:
         '200':
-          description: Paginated claims
+          description: Paginated claims list
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/PaginatedResponse'
+                $ref: '#/components/schemas/PaginatedClaimsResponse'
 
-  /api/v1/claims/history:
+  # ── Single Claim ────────────────────────────────────────────────────────────
+  /api/claims/{claimId}:
     get:
-      summary: Alternative alias for claim history
-      parameters: [] # same as above
-      responses:
-        '200':
-          description: Paginated claims
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/PaginatedResponse'
-
-  /api/v1/claims/{claimId}:
-    get:
+      tags: [Claims]
       summary: Get full claim details
       parameters:
-        - name: claimId
-          in: path
-          required: true
-          schema:
-            type: string
-            format: uuid
+        - $ref: '#/components/parameters/claimIdPath'
       responses:
         '200':
           description: Full claim details
@@ -269,10 +421,12 @@ paths:
         '404':
           $ref: '#/components/responses/Error404'
 
-  # ==================== MAKER FLOW ====================
-  /api/v1/maker/claims/pending:
+  # ── Maker – Available Queue ─────────────────────────────────────────────────
+  /api/claims/available/maker:
     get:
+      tags: [Maker]
       summary: Claims available for Maker review (status = NEW)
+      description: Returns all unassigned claims a Maker can pick up.
       responses:
         '200':
           description: List of available claims
@@ -283,54 +437,74 @@ paths:
                 items:
                   $ref: '#/components/schemas/ClaimDto'
 
-  /api/v1/claims/{claimId}/maker/assign:
-    post:
-      summary: Maker assigns/locks a claim (concurrency protection)
+  # ── Maker – Assign ──────────────────────────────────────────────────────────
+  /api/claims/{claimId}/maker-assign:
+    patch:
+      tags: [Maker]
+      summary: Maker assigns/locks a claim (concurrency-safe)
+      description: >
+        Atomically sets `assignedTo`, `assignedAt`, and transitions status to `MAKER_ASSIGNED`.
+        If two Makers request the same claim simultaneously, only the first succeeds; the second
+        receives `409 Conflict`.
       parameters:
-        - name: claimId
-          in: path
-          required: true
-          schema:
-            type: string
-            format: uuid
-      responses:
-        '200':
-          description: Claim assigned to Maker (status → MAKER_ASSIGNED)
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ClaimDto'
-        '409':
-          $ref: '#/components/responses/Error409'
-
-  /api/v1/claims/{claimId}/maker/recommendation:
-    post:
-      summary: Submit Maker recommendation & feedback
-      parameters:
-        - name: claimId
-          in: path
-          required: true
-          schema:
-            type: string
-            format: uuid
+        - $ref: '#/components/parameters/claimIdPath'
+        - $ref: '#/components/parameters/ifMatchHeader'
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/MakerRecommendationRequest'
+              $ref: '#/components/schemas/MakerAssignRequest'
       responses:
         '200':
-          description: Maker review saved (status → MAKER_REVIEWED)
+          description: Claim assigned to Maker – status is now MAKER_ASSIGNED
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ClaimDto'
+        '404':
+          $ref: '#/components/responses/Error404'
+        '409':
+          $ref: '#/components/responses/Error409'
 
-  # ==================== CHECKER FLOW ====================
-  /api/v1/checker/claims/pending:
+  # ── Maker – Review / Recommendation ────────────────────────────────────────
+  /api/claims/{claimId}/maker-review:
+    patch:
+      tags: [Maker]
+      summary: Submit Maker recommendation & feedback
+      description: >
+        Records `makerId`, `makerRecommendation`, `makerFeedback`, `makerReviewedAt`
+        and transitions status to `MAKER_REVIEWED`.
+        Claim must be in status `MAKER_ASSIGNED`.
+      parameters:
+        - $ref: '#/components/parameters/claimIdPath'
+        - $ref: '#/components/parameters/ifMatchHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MakerReviewRequest'
+      responses:
+        '200':
+          description: Maker review saved – status is now MAKER_REVIEWED
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClaimDto'
+        '400':
+          $ref: '#/components/responses/Error400'
+        '404':
+          $ref: '#/components/responses/Error404'
+        '409':
+          $ref: '#/components/responses/Error409'
+
+  # ── Checker – Available Queue ───────────────────────────────────────────────
+  /api/claims/available/checker:
     get:
+      tags: [Checker]
       summary: Claims ready for Checker review (status = MAKER_REVIEWED)
+      description: Returns all Maker-reviewed claims a Checker can pick up.
       responses:
         '200':
           description: List of claims awaiting Checker
@@ -341,49 +515,64 @@ paths:
                 items:
                   $ref: '#/components/schemas/ClaimDto'
 
-  /api/v1/claims/{claimId}/checker/assign:
-    post:
-      summary: Checker assigns/locks a claim (concurrency protection)
+  # ── Checker – Assign ────────────────────────────────────────────────────────
+  /api/claims/{claimId}/checker-assign:
+    patch:
+      tags: [Checker]
+      summary: Checker assigns/locks a claim (concurrency-safe)
+      description: >
+        Atomically sets `assignedTo`, `assignedAt`, and transitions status to `CHECKER_ASSIGNED`.
+        Returns `409 Conflict` if another Checker already claimed it.
       parameters:
-        - name: claimId
-          in: path
-          required: true
-          schema:
-            type: string
-            format: uuid
-      responses:
-        '200':
-          description: Claim assigned to Checker (status → CHECKER_ASSIGNED)
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ClaimDto'
-        '409':
-          $ref: '#/components/responses/Error409'
-
-  /api/v1/claims/{claimId}/checker/decision:
-    post:
-      summary: Submit Checker final decision + forwarding
-      description: |
-        Final decision. Automatically transitions status to COMPLETED → FORWARDED,
-        sets forwardedAt timestamp, and logs forwarding action (stub).
-      parameters:
-        - name: claimId
-          in: path
-          required: true
-          schema:
-            type: string
-            format: uuid
+        - $ref: '#/components/parameters/claimIdPath'
+        - $ref: '#/components/parameters/ifMatchHeader'
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/CheckerDecisionRequest'
+              $ref: '#/components/schemas/CheckerAssignRequest'
       responses:
         '200':
-          description: Final decision saved and claim forwarded
+          description: Claim assigned to Checker – status is now CHECKER_ASSIGNED
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ClaimDto'
+        '404':
+          $ref: '#/components/responses/Error404'
+        '409':
+          $ref: '#/components/responses/Error409'
+
+  # ── Checker – Final Decision ────────────────────────────────────────────────
+  /api/claims/{claimId}/checker-review:
+    patch:
+      tags: [Checker]
+      summary: Submit Checker final decision (auto-forwards claim)
+      description: >
+        Records `checkerId`, `checkerDecision`, `checkerFeedback`, `checkerReviewedAt`
+        and immediately transitions status `COMPLETED → FORWARDED`.
+        Sets `forwardedAt` and calls the forwarding stub (logged action only).
+        Claim must be in status `CHECKER_ASSIGNED`.
+      parameters:
+        - $ref: '#/components/parameters/claimIdPath'
+        - $ref: '#/components/parameters/ifMatchHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CheckerReviewRequest'
+      responses:
+        '200':
+          description: Final decision saved and claim forwarded – status is now FORWARDED
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClaimDto'
+        '400':
+          $ref: '#/components/responses/Error400'
+        '404':
+          $ref: '#/components/responses/Error404'
+        '409':
+          $ref: '#/components/responses/Error409'
